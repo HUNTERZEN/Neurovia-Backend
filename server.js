@@ -1,11 +1,8 @@
 require('dotenv').config();
 
-console.log('DB_USER:', process.env.DB_USER);
-console.log('DB_PASSWORD:', process.env.DB_PASSWORD ? '[SET]' : '[NOT SET]');
-
 const express = require('express');
 const cors = require('cors');
-const mysql = require('mysql2');
+const mongoose = require('mongoose'); 
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
@@ -13,7 +10,10 @@ const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const session = require('express-session');
 
-//  NEW: Twilio imports
+// Import your new MongoDB User model
+const User = require('./models/User'); 
+
+// Twilio imports
 const twilio = require('twilio');
 const AccessToken = twilio.jwt.AccessToken;
 const VideoGrant = AccessToken.VideoGrant;
@@ -39,22 +39,13 @@ app.use(session({
 app.use(passport.initialize());
 app.use(passport.session());
 
-// MySQL Connection
-const db = mysql.createConnection({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: process.env.DB_PORT || 3306
-});
-
-db.connect(err => {
-  if (err) {
+// MongoDB Connection
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('Connected to MongoDB database'))
+  .catch((err) => {
     console.error('Database connection failed:', err);
-    return;
-  }
-  console.log('Connected to MySQL database');
-});
+    process.exit(1);
+  });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
 
@@ -67,45 +58,55 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-// Google Strategy Configuration
+// Google Strategy Configuration for MongoDB
 passport.use(new GoogleStrategy({
     clientID: process.env.GOOGLE_CLIENT_ID,
     clientSecret: process.env.GOOGLE_CLIENT_SECRET,
     callbackURL: "/api/auth/google/callback"
   },
-  (accessToken, refreshToken, profile, done) => {
-    db.query('SELECT * FROM users WHERE google_id = ?', [profile.id], (err, results) => {
-      if (err) return done(err);
+  async (accessToken, refreshToken, profile, done) => {
+    try {
+      // Check if user already exists
+      let existingUser = await User.findOne({ google_id: profile.id });
 
-      if (results.length > 0) {
-        return done(null, results[0]);
-      } else {
-        db.query(
-          'INSERT INTO users (username, email, google_id, password) VALUES (?, ?, ?, NULL)',
-          [profile.displayName || '', profile.emails[0].value, profile.id],
-          (insertErr, insertResult) => {
-            if (insertErr) return done(insertErr);
-
-            db.query('SELECT * FROM users WHERE id = ?', [insertResult.insertId], (err2, newResults) => {
-              if (err2) return done(err2);
-              return done(null, newResults[0]);
-            });
-          }
-        );
+      if (existingUser) {
+        return done(null, existingUser);
       }
-    });
+
+      // If not, check if email exists from standard signup
+      existingUser = await User.findOne({ email: profile.emails[0].value });
+      if (existingUser) {
+        // Link google account to existing email
+        existingUser.google_id = profile.id;
+        await existingUser.save();
+        return done(null, existingUser);
+      }
+
+      // Create new user
+      const newUser = await User.create({
+        username: profile.displayName || '',
+        email: profile.emails[0].value,
+        google_id: profile.id
+      });
+
+      return done(null, newUser);
+    } catch (err) {
+      return done(err, false);
+    }
   }
 ));
 
-passport.serializeUser((user, done) => done(null, user.id));
-passport.deserializeUser((id, done) => {
-  db.query('SELECT * FROM users WHERE id = ?', [id], (err, results) => {
-    if (err) return done(err);
-    done(null, results[0]);
-  });
+passport.serializeUser((user, done) => done(null, user._id)); 
+passport.deserializeUser(async (id, done) => {
+  try {
+    const user = await User.findById(id);
+    done(null, user);
+  } catch (err) {
+    done(err, null);
+  }
 });
 
-//  NEW: Twilio Token Generation Route
+// Twilio Token Generation Route 
 app.post('/api/twilio/token', (req, res) => {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
   const apiKey = process.env.TWILIO_API_KEY;
@@ -114,113 +115,63 @@ app.post('/api/twilio/token', (req, res) => {
 
   const { identity, roomName } = req.body;
 
-  // Check if Twilio credentials are configured
   if (!accountSid || !apiKey || !apiSecret) {
     console.error('Missing Twilio credentials');
     return res.status(500).json({ 
-      error: 'Twilio credentials not configured',
-      details: {
-        accountSid: !!accountSid,
-        apiKey: !!apiKey,
-        apiSecret: !!apiSecret
-      }
+      error: 'Twilio credentials not configured'
     });
   }
 
   try {
-    // Create access token
     const token = new AccessToken(accountSid, apiKey, apiSecret, {
       identity: identity || `user_${Date.now()}`,
-      ttl: 3600, // 1 hour
+      ttl: 3600,
     });
 
-    // Add video grant if roomName provided
     if (roomName) {
-      const videoGrant = new VideoGrant({
-        room: roomName,
-      });
+      const videoGrant = new VideoGrant({ room: roomName });
       token.addGrant(videoGrant);
-      console.log(`Video grant added for room: ${roomName}`);
     }
 
-    // Add chat grant if service configured
     if (chatServiceSid) {
-      const chatGrant = new ChatGrant({
-        serviceSid: chatServiceSid,
-      });
+      const chatGrant = new ChatGrant({ serviceSid: chatServiceSid });
       token.addGrant(chatGrant);
-      console.log('Chat grant added');
     }
-
-    const jwtToken = token.toJwt();
-    console.log('Twilio token generated successfully for:', identity);
 
     res.json({
-      token: jwtToken,
+      token: token.toJwt(),
       identity: identity || `user_${Date.now()}`,
       roomName: roomName
     });
   } catch (error) {
-    console.error('Error generating Twilio token:', error);
-    res.status(500).json({ 
-      error: 'Failed to generate token',
-      message: error.message 
-    });
+    res.status(500).json({ error: 'Failed to generate token' });
   }
 });
 
-//  NEW: Get Twilio Configuration Status
+// Get Twilio Configuration Status
 app.get('/api/twilio/status', (req, res) => {
-  const status = {
+  res.json({
     configured: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_API_KEY && process.env.TWILIO_API_SECRET),
-    accountSid: !!process.env.TWILIO_ACCOUNT_SID,
-    apiKey: !!process.env.TWILIO_API_KEY,
-    apiSecret: !!process.env.TWILIO_API_SECRET,
-    chatService: !!process.env.TWILIO_CHAT_SERVICE_SID
-  };
-  
-  res.json(status);
+  });
 });
 
 // Google OAuth Routes
-app.get('/api/auth/google',
-  passport.authenticate('google', { scope: ['profile', 'email'] })
-);
+app.get('/api/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
 
-// **UPDATED:** JWT-based Google callback
 app.get('/api/auth/google/callback',
   passport.authenticate('google', { failureRedirect: '/login', session: false }),
   (req, res) => {
-    // Generate JWT token
     const token = jwt.sign(
-      { userId: req.user.id, username: req.user.username, email: req.user.email },
+      { userId: req.user._id, username: req.user.username, email: req.user.email }, 
       JWT_SECRET,
       { expiresIn: '1h' }
     );
-
-    // Redirect to frontend with token
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     res.redirect(`${frontendUrl}/?token=${token}`);
   }
 );
 
-// Session check endpoint for Google OAuth
-app.get('/api/auth/check', (req, res) => {
-  if (req.isAuthenticated && req.isAuthenticated()) {
-    res.json({ 
-      authenticated: true, 
-      user: { 
-        id: req.user.id, 
-        username: req.user.username, 
-        email: req.user.email 
-      } 
-    });
-  } else {
-    res.json({ authenticated: false });
-  }
-});
-
-// Sign Up Route
+// Sign Up Route for MongoDB
 app.post('/api/signup', async (req, res) => {
   const { username, password, email } = req.body;
 
@@ -229,119 +180,94 @@ app.post('/api/signup', async (req, res) => {
   }
 
   try {
+    // Check if user already exists
+    const existingUser = await User.findOne({ $or: [{ email }, { username }] });
+    if (existingUser) {
+      return res.status(409).json({ error: 'Username or email already exists' });
+    }
+
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    db.query(
-      'INSERT INTO users (username, password, email) VALUES (?, ?, ?)',
-      [username, hashedPassword, email],
-      (err) => {
-        if (err) {
-          if (err.code === 'ER_DUP_ENTRY') {
-            return res.status(409).json({ error: 'Username already exists' });
-          }
-          return res.status(500).json({ error: 'Database error' });
-        }
+    // Create new user in MongoDB
+    await User.create({
+      username,
+      email,
+      password: hashedPassword
+    });
 
-        // Send welcome email
-        const mailOptions = {
-          from: process.env.EMAIL_USER,
-          to: email,
-          subject: 'Welcome to Our App!',
-          text: `Hello ${username},\n\nThank you for registering. We're glad to have you!`
-        };
+    // Send welcome email
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject: 'Welcome to Our App!',
+      text: `Hello ${username},\n\nThank you for registering. We're glad to have you!`
+    };
 
-        transporter.sendMail(mailOptions, (error, info) => {
-          if (error) {
-            console.error('Failed to send welcome email:', error);
-          } else {
-            console.log('Email sent: ' + info.response);
-          }
-        });
+    transporter.sendMail(mailOptions, (error, info) => {
+      if (error) console.error('Failed to send welcome email:', error);
+    });
 
-        res.status(201).json({ message: 'User registered and welcome email sent' });
-      }
-    );
+    res.status(201).json({ message: 'User registered and welcome email sent' });
   } catch (error) {
+    console.error(error);
     res.status(500).json({ error: 'Server error during sign up' });
   }
 });
 
-//  UPDATED LOGIN ROUTE - Returns user data along with token
-app.post('/api/login', (req, res) => {
+// Login Route for MongoDB
+app.post('/api/login', async (req, res) => {
   const { login, password } = req.body;
 
-  db.query(
-    'SELECT * FROM users WHERE username = ? OR email = ?',
-    [login, login],
-    async (err, results) => {
-      if (err || results.length === 0) {
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
+  try {
+    // Find user by username OR email
+    const user = await User.findOne({ $or: [{ email: login }, { username: login }] });
 
-      const user = results[0];
-      
-      // Skip password check if user signed up with Google (password is NULL)
-      if (user.password === null) {
-        return res.status(401).json({ error: 'Please sign in with Google' });
-      }
-
-      const isMatch = await bcrypt.compare(password, user.password);
-      if (!isMatch) {
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
-
-      const token = jwt.sign(
-        { userId: user.id, username: user.username, email: user.email }, // Include email
-        JWT_SECRET, 
-        { expiresIn: '1h' }
-      );
-
-      // ✅ RETURN BOTH TOKEN AND USER DATA
-      res.json({ 
-        message: 'Login successful', 
-        token,
-        user: {
-          id: user.id,
-          username: user.username,
-          email: user.email
-        }
-      });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
-  );
+
+    if (!user.password) {
+      return res.status(401).json({ error: 'Please sign in with Google' });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign(
+      { userId: user._id, username: user.username, email: user.email }, 
+      JWT_SECRET, 
+      { expiresIn: '1h' }
+    );
+
+    res.json({ 
+      message: 'Login successful', 
+      token,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Server error during login' });
+  }
 });
 
-//  UPDATED LOGOUT ROUTE - Handles both JWT and Google OAuth sessions
+// Logout Route
 app.post('/api/logout', (req, res) => {
-  // Destroy session if it exists (for Google OAuth users)
-  if (req.session) {
-    req.session.destroy((err) => {
-      if (err) {
-        console.error('Session destroy error:', err);
-      }
-    });
-  }
+  if (req.session) req.session.destroy();
+  if (req.isAuthenticated && req.isAuthenticated()) req.logout((err) => {});
   
-  // Logout passport session if user is authenticated
-  if (req.isAuthenticated && req.isAuthenticated()) {
-    req.logout((err) => {
-      if (err) console.error('Passport logout error:', err);
-    });
-  }
-  
-  // Clear session cookie - handles different possible cookie names
-  res.clearCookie('connect.sid'); // Default express-session cookie name
-  res.clearCookie('session'); // Alternative session cookie name
-  
-  // Clear any other auth-related cookies
+  res.clearCookie('connect.sid'); 
+  res.clearCookie('session'); 
   res.clearCookie('authToken');
   
-  res.json({ 
-    message: 'Logout successful. Please delete the token on client side.',
-    success: true 
-  });
+  res.json({ message: 'Logout successful', success: true });
 });
 
-//  UPDATED PROFILE ROUTE - Returns user data in correct format
+// Profile Route
 app.get('/api/profile', (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Token required' });
@@ -350,7 +276,6 @@ app.get('/api/profile', (req, res) => {
   jwt.verify(token, JWT_SECRET, (err, decoded) => {
     if (err) return res.status(403).json({ error: 'Invalid or expired token' });
 
-    //  RETURN USER DATA IN CORRECT FORMAT
     res.json({ 
       message: 'Access granted', 
       user: {
@@ -362,32 +287,8 @@ app.get('/api/profile', (req, res) => {
   });
 });
 
-// Test Email Route
-app.post('/api/send-email', (req, res) => {
-  const { to, subject, text } = req.body;
-
-  const mailOptions = {
-    from: process.env.EMAIL_USER,
-    to,
-    subject,
-    text
-  };
-
-  transporter.sendMail(mailOptions, (err, info) => {
-    if (err) {
-      console.error('Email send failed:', err);
-      return res.status(500).json({ error: 'Email failed to send' });
-    }
-    res.json({ message: 'Email sent!', info });
-  });
-});
-
 // Start Server
 const PORT = process.env.APP_PORT || 8080;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log('Available endpoints:');
-  console.log('  - POST /api/twilio/token (Generate Twilio token)');
-  console.log('  - GET /api/twilio/status (Check Twilio configuration)');
-  console.log('  - All existing endpoints...');
 });
