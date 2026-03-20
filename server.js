@@ -196,14 +196,54 @@ app.post('/api/logout', (req, res) => {
   res.json({ message: 'Logout successful', success: true });
 });
 
-app.get('/api/profile', (req, res) => {
+app.get('/api/profile', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Token required' });
   const token = authHeader.split(' ')[1];
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
-    if (err) return res.status(403).json({ error: 'Invalid token' });
-    res.json({ user: { id: decoded.userId, username: decoded.username, email: decoded.email } });
-  });
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    // Fetch full user details from DB excluding the password
+    const user = await User.findById(decoded.userId).select('-password');
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    
+    // Convert to a format expected by frontend. The _id needs to be accessible as 'id' too
+    const userObj = user.toObject();
+    res.json({ user: { ...userObj, id: userObj._id } });
+  } catch (err) {
+    res.status(403).json({ error: 'Invalid token' });
+  }
+});
+
+// Update Profile route
+app.put('/api/profile', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Token required' });
+  const token = authHeader.split(' ')[1];
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const updatedData = req.body;
+    
+    // Prevent sensitive fields from being updated via this route
+    delete updatedData.password;
+    delete updatedData.email;
+    delete updatedData.username;
+    
+    const updatedUser = await User.findByIdAndUpdate(
+      decoded.userId,
+      { $set: updatedData },
+      { new: true, runValidators: true }
+    ).select('-password');
+    
+    if (!updatedUser) return res.status(404).json({ error: 'User not found' });
+    
+    const userObj = updatedUser.toObject();
+    res.json({ message: 'Profile updated successfully', user: { ...userObj, id: userObj._id } });
+  } catch (err) {
+    console.error('Profile update error:', err);
+    res.status(403).json({ error: 'Invalid token or update failed' });
+  }
 });
 
 app.use('/api/partner', partnerRoutes);
