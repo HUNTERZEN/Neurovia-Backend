@@ -1,6 +1,4 @@
 require('dotenv').config();
-const https = require('https');
-const http = require('http');
 
 const express = require('express');
 const cors = require('cors');
@@ -257,32 +255,7 @@ app.get('/health', (_req, res) => {
   res.status(200).json({ status: 'ok', uptime: process.uptime() });
 });
 
-// ──────────────────────────────────────────────────────────
-// Self-ping keep-alive to prevent Render free-tier sleeping
-// Pings /health every 14 minutes (Render sleeps after 15)
-// ──────────────────────────────────────────────────────────
-const KEEP_ALIVE_URL = process.env.RENDER_EXTERNAL_URL || process.env.BACKEND_URL || 'https://neurovia-backend.onrender.com';
-const KEEP_ALIVE_INTERVAL = 14 * 60 * 1000; // 14 minutes
-
-function keepAlive() {
-  const url = `${KEEP_ALIVE_URL}/health`;
-  const client = url.startsWith('https') ? https : http;
-
-  client.get(url, (res) => {
-    console.log(`[Keep-Alive] Pinged ${url} — Status: ${res.statusCode}`);
-  }).on('error', (err) => {
-    console.error(`[Keep-Alive] Ping failed:`, err.message);
-  });
-}
-
 const PORT = process.env.APP_PORT || 8080;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-
-  // Only start keep-alive in production (on Render)
-  if (process.env.NODE_ENV === 'production' || process.env.RENDER) {
-    console.log(`[Keep-Alive] Started — pinging every 14 minutes`);
-    setInterval(keepAlive, KEEP_ALIVE_INTERVAL);
-    keepAlive(); // Initial ping
-  }
 });
