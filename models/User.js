@@ -1,50 +1,64 @@
 const mongoose = require('mongoose');
 
-const userSchema = new mongoose.Schema({
-  // In your old code you called it 'name', in your server.js you called it 'username'. 
-  // Let's stick with 'username' to match your signup form.
-  username: { 
-    type: String, 
-    required: true 
+const userSchema = new mongoose.Schema(
+  {
+    username: {
+      type: String,
+      required: true,
+      trim: true,
+      maxlength: 64,
+    },
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
+      maxlength: 254,
+    },
+    password: {
+      type: String,
+      required: false,
+    },
+    google_id: {
+      type: String,
+      required: false,
+      unique: true,
+      sparse: true,
+    },
+    role: {
+      type: String,
+      enum: ['user', 'partner', 'technician', 'admin'],
+      default: 'user',
+    },
+    status: {
+      type: String,
+      enum: ['active', 'inactive'],
+      default: 'active',
+    },
+    resetPasswordTokenHash: { type: String, select: false },
+    resetPasswordExpires: { type: Date, select: false },
+    // --- Additional Profile Fields ---
+    fullName: { type: String, trim: true, maxlength: 120 },
+    phone: { type: String, trim: true, maxlength: 30 },
+    location: { type: String, trim: true, maxlength: 120 },
+    profession: { type: String, trim: true, maxlength: 120 },
+    company: { type: String, trim: true, maxlength: 120 },
+    bio: { type: String, trim: true, maxlength: 1000 },
+    website: { type: String, trim: true, maxlength: 255 },
+    github: { type: String, trim: true, maxlength: 255 },
+    linkedin: { type: String, trim: true, maxlength: 255 },
+    twitter: { type: String, trim: true, maxlength: 255 },
+    profileImage: { type: String, default: '/api/placeholder/150/150', maxlength: 500 },
+    joinDate: {
+      type: String,
+      default: () => new Date().getFullYear().toString(),
+    },
   },
-  email: { 
-    type: String, 
-    required: true, 
-    unique: true 
-  },
-  password: { 
-    type: String, 
-    // Not required because users who sign in with Google won't have a password!
-    required: false 
-  },
-  google_id: { 
-    type: String, 
-    required: false,
-    unique: true,
-    // 'sparse' means MongoDB allows multiple users to have a 'null' google_id
-    sparse: true 
-  },
-  // --- Additional Profile Fields ---
-  fullName: { type: String },
-  phone: { type: String },
-  location: { type: String },
-  profession: { type: String },
-  company: { type: String },
-  bio: { type: String },
-  website: { type: String },
-  github: { type: String },
-  linkedin: { type: String },
-  twitter: { type: String },
-  profileImage: { type: String, default: '/api/placeholder/150/150' },
-  joinDate: { 
-    type: String,
-    // Provide a default join year based on when the user is created
-    default: () => new Date().getFullYear().toString()
+  {
+    timestamps: true,
   }
-}, { 
-  // Automatically adds createdAt and updatedAt timestamps
-  timestamps: true 
-});
+);
 
-const User = mongoose.model('User', userSchema);
+const User = mongoose.models.User || mongoose.model('User', userSchema);
 module.exports = User;
