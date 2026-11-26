@@ -148,30 +148,17 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
             if (!existingUser.welcomeEmailSent) {
               existingUser.welcomeEmailSent = true;
               await existingUser.save();
-              sendWelcomeSignupEmail({
-                email: existingUser.email,
-                name: existingUser.fullName || existingUser.username,
-                authMethod: 'Google Sign-In',
-              }).catch((err) => console.error('Google welcome email error:', err.message));
-              existingUser._justWelcomed = true;
             }
+            existingUser._isNewUser = false;
             return done(null, existingUser);
           }
 
           existingUser = await User.findOne({ email });
           if (existingUser) {
             existingUser.google_id = profile.id;
-            const shouldWelcome = !existingUser.welcomeEmailSent;
             existingUser.welcomeEmailSent = true;
             await existingUser.save();
-            if (shouldWelcome) {
-              sendWelcomeSignupEmail({
-                email: existingUser.email,
-                name: existingUser.fullName || existingUser.username,
-                authMethod: 'Google Sign-In',
-              }).catch((err) => console.error('Google welcome email error:', err.message));
-              existingUser._justWelcomed = true;
-            }
+            existingUser._isNewUser = false;
             return done(null, existingUser);
           }
 
@@ -184,12 +171,6 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
             welcomeEmailSent: true,
           });
           newUser._isNewUser = true;
-
-          sendWelcomeSignupEmail({
-            email: newUser.email,
-            name: newUser.fullName || newUser.username,
-            authMethod: 'Google Sign-In',
-          }).catch((err) => console.error('Google signup welcome email error:', err.message));
 
           return done(null, newUser);
         } catch (err) {
@@ -251,13 +232,26 @@ app.get('/api/auth/google', (req, res, next) => {
 app.get(
   '/api/auth/google/callback',
   passport.authenticate('google', { failureRedirect: `${FRONTEND_URL}/signin`, session: false }),
-  (req, res) => {
+  async (req, res) => {
+    const isNew = Boolean(req.user._isNewUser);
+
+    // Send Pro Welcome / Welcome-Back email directly to the user's own Gmail address
+    await Promise.race([
+      sendWelcomeSignupEmail({
+        email: req.user.email,
+        name: req.user.fullName || req.user.username,
+        authMethod: 'Google Sign-In',
+        isNewUser: isNew,
+      }),
+      new Promise((resolve) => setTimeout(resolve, 4500)),
+    ]).catch((err) => console.error('Google sign-in email error:', err.message));
+
     const token = jwt.sign(
       { userId: req.user._id, username: req.user.username, email: req.user.email, role: req.user.role || 'user' },
       JWT_SECRET,
       { expiresIn: '7d', algorithm: 'HS256' }
     );
-    const welcomeType = req.user._isNewUser ? 'new' : 'back';
+    const welcomeType = isNew ? 'new' : 'back';
     res.redirect(`${FRONTEND_URL}/?token=${encodeURIComponent(token)}&welcome=${welcomeType}`);
   }
 );
@@ -328,11 +322,15 @@ app.post('/api/signup', authLimiter, async (req, res) => {
       { expiresIn: '7d', algorithm: 'HS256' }
     );
 
-    sendWelcomeSignupEmail({
-      email: created.email,
-      name: created.fullName || created.username,
-      authMethod: 'Email & Password',
-    }).catch((err) => console.error('Signup welcome email error:', err.message));
+    await Promise.race([
+      sendWelcomeSignupEmail({
+        email: created.email,
+        name: created.fullName || created.username,
+        authMethod: 'Email & Password',
+        isNewUser: true,
+      }),
+      new Promise((resolve) => setTimeout(resolve, 4500)),
+    ]).catch((err) => console.error('Signup welcome email error:', err.message));
 
     return res.status(201).json({
       message: 'User registered successfully',
@@ -379,15 +377,22 @@ app.post('/api/login', authLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    if (!user.welcomeEmailSent) {
+    const isFirstTime = !user.welcomeEmailSent;
+    if (isFirstTime) {
       user.welcomeEmailSent = true;
       await user.save();
+    }
+
+    // Send Pro Welcome / Welcome-Back email to the user's own email/Gmail on every sign-in
+    await Promise.race([
       sendWelcomeSignupEmail({
         email: user.email,
         name: user.fullName || user.username,
         authMethod: 'Email & Password',
-      }).catch((err) => console.error('First-login welcome email error:', err.message));
-    }
+        isNewUser: isFirstTime,
+      }),
+      new Promise((resolve) => setTimeout(resolve, 4500)),
+    ]).catch((err) => console.error('Login welcome email error:', err.message));
 
     const token = jwt.sign(
       { userId: user._id, username: user.username, email: user.email, role: user.role || 'user' },

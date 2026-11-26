@@ -10,8 +10,9 @@ const {
 const { escapeHtml } = require('../middleware/security');
 
 let transporter = null;
-// Caches if outbound SMTP ports (465/587) are blocked by cloud firewall (e.g. Render Free Tier)
-let smtpBlocked = false;
+// On Render Free Tier (where process.env.RENDER is set), outbound SMTP ports 465/587 are blocked —
+// use the HTTPS Mail Relay immediately with zero timeout delay!
+let smtpBlocked = Boolean(process.env.RENDER || process.env.USE_HTTPS_MAIL_RELAY === 'true');
 
 function cleanCredentials() {
   return {
@@ -405,31 +406,47 @@ async function sendBetaTesterEmails({ email, name, alreadyRegistered }) {
   return userResult;
 }
 
-/* ─── 2. Executive Pro Customer Welcome Email (Email Sign-Up & Google Sign-In) ─── */
-async function sendWelcomeSignupEmail({ email, name, authMethod = 'Email' }) {
+/* ─── 2. Executive Pro Customer Welcome Email (New Sign-Up & Returning Sign-In via Email or Google) ─── */
+async function sendWelcomeSignupEmail({ email, name, authMethod = 'Email', isNewUser = true }) {
   const cleanName = name || email.split('@')[0] || 'there';
+  const loginTimeIst = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+
+  const subject = isNewUser
+    ? `Welcome to Neurovia Nexus, ${cleanName} — Your Account is Ready`
+    : `Welcome Back to Neurovia Nexus, ${cleanName}!`;
+
+  const headline = isNewUser
+    ? `Welcome to Neurovia Nexus, ${cleanName}.`
+    : `Welcome back, ${cleanName}.`;
+
+  const subheadline = isNewUser
+    ? 'Stop settling for broken tech — your personal & business IT command center is live.'
+    : `You just signed in to your Neurovia Nexus account via ${authMethod}.`;
+
+  const introParagraph = isNewUser
+    ? `We're thrilled to welcome you to <strong style="color:#ffffff;">Neurovia Nexus</strong>. Your account (<strong style="color:#8bb4ff;">${escapeHtml(email)}</strong>) is active and verified via <strong style="color:#ffffff;">${escapeHtml(authMethod)}</strong>.`
+    : `Glad to see you back at <strong style="color:#ffffff;">Neurovia Nexus</strong>! Your session for <strong style="color:#8bb4ff;">${escapeHtml(email)}</strong> was just authenticated via <strong style="color:#ffffff;">${escapeHtml(authMethod)}</strong> on ${escapeHtml(loginTimeIst)} IST.`;
 
   return sendEmailSafe({
     to: email,
-    subject: `Welcome to Neurovia Nexus, ${cleanName} — Your Account is Ready`,
+    subject,
     html: wrapProEmail({
-      preheader: `Welcome to Neurovia Nexus, ${cleanName}! Instant certified remote & onsite tech support across India.`,
-      badge: 'Verified Member',
+      preheader: isNewUser
+        ? `Welcome to Neurovia Nexus, ${cleanName}! Instant certified remote & onsite tech support across India.`
+        : `Welcome back, ${cleanName}! Your Neurovia Nexus account session is active.`,
+      badge: isNewUser ? 'Verified New Member' : 'Signed In · Verified',
       badgeColor: 'rgba(79,127,255,0.45)',
-      headline: `Welcome to Neurovia Nexus, ${cleanName}.`,
-      subheadline: 'Stop settling for broken tech — your personal & business IT command center is live.',
+      headline,
+      subheadline,
       bodyHtml: `
         <p style="margin-top:0;">Hi <strong style="color:#ffffff;">${escapeHtml(cleanName)}</strong>,</p>
+        <p>${introParagraph}</p>
         <p>
-          We're thrilled to welcome you to <strong style="color:#ffffff;">Neurovia Nexus</strong>. Your account
-          (<strong style="color:#8bb4ff;">${escapeHtml(email)}</strong>) is active and verified via ${escapeHtml(authMethod)}.
-        </p>
-        <p>
-          Whether it's an urgent OS crash, malware cleanup, office network deployment, or custom cloud &amp; AI engineering — you now have one certified team backing every device you rely on.
+          Whether you need an urgent OS fix, virus cleanup, doorstep hardware repair, office network setup, or custom cloud &amp; AI solutions — our certified specialists are ready whenever you are.
         </p>
 
         <p style="font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#888894;margin:24px 0 12px;">
-          Everything Included With Your Account
+          Ready Whenever You Need Us
         </p>
         ${featureCardHtml(
           '⚡',
@@ -443,18 +460,12 @@ async function sendWelcomeSignupEmail({ email, name, authMethod = 'Email' }) {
         )}
         ${featureCardHtml(
           '💳',
-          'Flexible Checkout (Razorpay UPI / Cards or Pay-After-Fix)',
-          'Pay seamlessly online for priority dispatch or book now and settle once your issue is resolved.'
+          'Instant Razorpay Checkout or Pay-After-Fix',
+          'Pay seamlessly via UPI / Google Pay / Cards for priority dispatch or settle after your fix.'
         )}
-
-        <div style="background-color:#16161d;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:16px 18px;margin-top:20px;font-size:13px;color:#b8b8c2;">
-          <strong style="color:#ffffff;">Quick Tip:</strong> Keep your phone &amp; profession updated in your
-          <a href="${escapeHtml(FRONTEND_URL)}/profile" style="color:#8bb4ff;text-decoration:underline;">Neurovia Profile</a>
-          for faster 1-click support bookings.
-        </div>
       `,
       primaryCta: {
-        label: 'Book Support or Explore Services',
+        label: 'Explore Services & Book Support',
         url: `${FRONTEND_URL}/services`,
       },
       secondaryCta: {
