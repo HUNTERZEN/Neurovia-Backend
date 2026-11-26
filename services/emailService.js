@@ -1,223 +1,553 @@
+const crypto = require('crypto');
 const nodemailer = require('nodemailer');
-const { EMAIL_USER, EMAIL_PASS, COMPANY_TEAM_EMAILS, FRONTEND_URL } = require('../config/env');
+const {
+  EMAIL_USER,
+  EMAIL_PASS,
+  MAIL_RELAY_URL,
+  COMPANY_TEAM_EMAILS,
+  FRONTEND_URL,
+} = require('../config/env');
 const { escapeHtml } = require('../middleware/security');
 
 let transporter = null;
+// Caches if outbound SMTP ports (465/587) are blocked by cloud firewall (e.g. Render Free Tier)
+let smtpBlocked = false;
+
+function cleanCredentials() {
+  return {
+    user: (EMAIL_USER || '').trim(),
+    pass: (EMAIL_PASS || '').replace(/\s+/g, ''),
+  };
+}
 
 function getTransporter() {
-  if (!EMAIL_USER || !EMAIL_PASS) {
+  const { user, pass } = cleanCredentials();
+  if (!user || !pass) {
     return null;
   }
   if (!transporter) {
     transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: {
-        user: EMAIL_USER.trim(),
-        // Strip spaces automatically in case Google App Password was pasted as "xxxx xxxx xxxx xxxx"
-        pass: EMAIL_PASS.replace(/\s+/g, ''),
-      },
-      pool: true,
-      maxConnections: 3,
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
+      auth: { user, pass },
+      connectionTimeout: 4500,
+      greetingTimeout: 4500,
+      socketTimeout: 8000,
     });
   }
   return transporter;
 }
 
 function isEmailConfigured() {
-  return Boolean(EMAIL_USER && EMAIL_PASS);
-}
-
-function wrapLayout({ badge, title, bodyHtml, ctaLabel, ctaUrl }) {
-  const safeBadge = escapeHtml(badge || 'NEUROVIA NEXUS');
-  const safeTitle = escapeHtml(title || '');
-  const ctaBlock =
-    ctaLabel && ctaUrl
-      ? `<div style="margin-top:28px;">
-           <a href="${escapeHtml(ctaUrl)}" style="display:inline-block;background:#ffffff;color:#080808;font-weight:700;font-size:14px;padding:13px 26px;border-radius:999px;text-decoration:none;">
-             ${escapeHtml(ctaLabel)} →
-           </a>
-         </div>`
-      : '';
-
-  return `<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8" /></head>
-<body style="margin:0;padding:24px;background:#080808;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#e8e8e8;">
-  <div style="max-width:600px;margin:0 auto;background:#121214;border:1px solid rgba(255,255,255,0.1);border-radius:20px;overflow:hidden;">
-    <div style="padding:24px 32px;border-bottom:1px solid rgba(255,255,255,0.08);background:#0d0d10;">
-      <span style="display:inline-block;padding:4px 10px;border-radius:999px;background:rgba(79,127,255,0.15);border:1px solid rgba(79,127,255,0.3);color:#8bb4ff;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;">
-        ${safeBadge}
-      </span>
-      <h1 style="margin:14px 0 0;font-size:24px;font-weight:800;color:#ffffff;letter-spacing:-0.02em;">
-        ${safeTitle}
-      </h1>
-    </div>
-    <div style="padding:28px 32px;font-size:15px;line-height:1.65;color:#cccccc;">
-      ${bodyHtml}
-      ${ctaBlock}
-    </div>
-    <div style="padding:20px 32px;border-top:1px solid rgba(255,255,255,0.08);font-size:12px;color:#777777;background:#0b0b0d;">
-      <strong style="color:#ffffff;">Neurovia Nexus Pvt. Ltd.</strong> · Guwahati, Assam, India<br/>
-      Support: <a href="mailto:support@neurovia.site" style="color:#8bb4ff;text-decoration:none;">support@neurovia.site</a> · +91 88220 96485
-    </div>
-  </div>
-</body>
-</html>`;
+  const { user, pass } = cleanCredentials();
+  return Boolean(user && pass);
 }
 
 function stripHeaderCrlf(str) {
   return String(str || '').replace(/[\r\n]+/g, ' ').trim();
 }
 
-async function sendEmailSafe({ to, subject, html, replyTo }) {
-  const tx = getTransporter();
-  if (!tx) {
-    console.warn(`[EMAIL] Skipped "${subject}" -> ${to} (EMAIL_USER/EMAIL_PASS not configured)`);
-    return { sent: false, reason: 'not_configured' };
+async function sendViaHttpsRelay({ user, pass, to, subject, html, replyTo }) {
+  if (!MAIL_RELAY_URL) {
+    return { sent: false, reason: 'no_relay_url' };
   }
-
   try {
-    const rawRecipients = Array.isArray(to) ? to : [to];
-    const cleanTo = rawRecipients.map(stripHeaderCrlf).filter(Boolean).join(', ');
-    const cleanSubject = stripHeaderCrlf(subject);
-    const cleanReplyTo = replyTo ? stripHeaderCrlf(replyTo) : undefined;
+    const ts = String(Date.now());
+    const sig = crypto
+      .createHmac('sha256', pass)
+      .update(`${ts}:${user.toLowerCase()}:${to}:${subject}`)
+      .digest('hex');
 
-    const info = await tx.sendMail({
-      from: `"Neurovia Nexus" <${stripHeaderCrlf(EMAIL_USER)}>`,
-      to: cleanTo,
-      subject: cleanSubject,
-      html,
-      ...(cleanReplyTo ? { replyTo: cleanReplyTo } : {}),
+    const res = await fetch(MAIL_RELAY_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Neurovia-Relay-Ts': ts,
+        'X-Neurovia-Relay-Sig': sig,
+      },
+      body: JSON.stringify({
+        fromUser: user.toLowerCase(),
+        appPass: pass,
+        to,
+        subject,
+        html,
+        ...(replyTo ? { replyTo } : {}),
+      }),
     });
-    return { sent: true, messageId: info.messageId };
+
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.sent) {
+      return { sent: true, messageId: data.messageId, via: 'https-relay' };
+    }
+    console.error(`[EMAIL RELAY ERROR] HTTP ${res.status}:`, data.error || 'unknown');
+    return { sent: false, reason: data.error || `relay_http_${res.status}` };
   } catch (err) {
-    console.error(`[EMAIL ERROR] Failed sending "${subject}":`, err.message);
+    console.error('[EMAIL RELAY NETWORK ERROR]:', err.message);
     return { sent: false, reason: err.message };
   }
 }
 
-/* ─── 1. Beta Tester Registration ─── */
+async function sendEmailSafe({ to, subject, html, replyTo }) {
+  const { user, pass } = cleanCredentials();
+  if (!user || !pass) {
+    console.warn(`[EMAIL] Skipped "${subject}" -> ${to} (EMAIL_USER/EMAIL_PASS not configured)`);
+    return { sent: false, reason: 'not_configured' };
+  }
+
+  const rawRecipients = Array.isArray(to) ? to : [to];
+  const cleanTo = rawRecipients.map(stripHeaderCrlf).filter(Boolean).join(', ');
+  const cleanSubject = stripHeaderCrlf(subject);
+  const cleanReplyTo = replyTo ? stripHeaderCrlf(replyTo) : undefined;
+
+  // 1) Try direct SMTP first unless we already detected outbound port 465 is blocked
+  if (!smtpBlocked) {
+    try {
+      const tx = getTransporter();
+      const info = await tx.sendMail({
+        from: `"Neurovia Nexus" <${stripHeaderCrlf(user)}>`,
+        to: cleanTo,
+        subject: cleanSubject,
+        html,
+        ...(cleanReplyTo ? { replyTo: cleanReplyTo } : {}),
+      });
+      return { sent: true, messageId: info.messageId, via: 'smtp' };
+    } catch (err) {
+      const code = String(err.code || '');
+      const msg = String(err.message || '');
+      if (
+        code === 'ETIMEDOUT' ||
+        code === 'ESOCKET' ||
+        code === 'ECONNREFUSED' ||
+        code === 'ENETUNREACH' ||
+        /timeout/i.test(msg)
+      ) {
+        console.warn('[EMAIL] Direct SMTP port blocked/timed out — switching to HTTPS Mail Relay.');
+        smtpBlocked = true;
+      } else {
+        console.error(`[EMAIL SMTP ERROR] "${cleanSubject}":`, msg);
+        return { sent: false, reason: msg };
+      }
+    }
+  }
+
+  // 2) Fallback to HTTPS Mail Relay over port 443 (works on Render Free Tier)
+  return sendViaHttpsRelay({
+    user,
+    pass,
+    to: cleanTo,
+    subject: cleanSubject,
+    html,
+    replyTo: cleanReplyTo,
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   EXECUTIVE PRO HTML EMAIL DESIGN SYSTEM (Gmail / iOS / Outlook Safe)
+═══════════════════════════════════════════════════════════════ */
+function wrapProEmail({
+  preheader,
+  badge,
+  badgeColor = '#4f7fff',
+  headline,
+  subheadline,
+  bodyHtml,
+  primaryCta,
+  secondaryCta,
+  showSignoff = false,
+}) {
+  const safePreheader = escapeHtml(preheader || headline || 'Neurovia Nexus');
+  const safeBadge = escapeHtml(badge || 'NEUROVIA NEXUS');
+  const safeHeadline = escapeHtml(headline || '');
+  const safeSub = subheadline ? escapeHtml(subheadline) : '';
+
+  const primaryBtnHtml =
+    primaryCta?.label && primaryCta?.url
+      ? `<td style="padding-right:12px;padding-bottom:10px;">
+           <a href="${escapeHtml(primaryCta.url)}" style="display:inline-block;background-color:#ffffff;color:#080808;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:14px;font-weight:700;text-decoration:none;padding:14px 28px;border-radius:999px;border:1px solid #ffffff;">
+             ${escapeHtml(primaryCta.label)} &rarr;
+           </a>
+         </td>`
+      : '';
+
+  const secondaryBtnHtml =
+    secondaryCta?.label && secondaryCta?.url
+      ? `<td style="padding-bottom:10px;">
+           <a href="${escapeHtml(secondaryCta.url)}" style="display:inline-block;background-color:#18181c;color:#e8e8e8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;font-weight:600;text-decoration:none;padding:13px 22px;border-radius:999px;border:1px solid rgba(255,255,255,0.16);">
+             ${escapeHtml(secondaryCta.label)}
+           </a>
+         </td>`
+      : '';
+
+  const ctaRow =
+    primaryBtnHtml || secondaryBtnHtml
+      ? `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:28px;">
+           <tr>${primaryBtnHtml}${secondaryBtnHtml}</tr>
+         </table>`
+      : '';
+
+  const signoffBlock = showSignoff
+    ? `<div style="margin-top:32px;padding-top:24px;border-top:1px solid rgba(255,255,255,0.08);">
+         <p style="margin:0 0 4px;font-size:14px;color:#aaaaaa;">Warm regards,</p>
+         <p style="margin:0 0 2px;font-size:15px;font-weight:700;color:#ffffff;">The Founding &amp; Engineering Team</p>
+         <p style="margin:0;font-size:12px;color:#8bb4ff;">Neurovia Nexus Pvt. Ltd. &middot; Certified IT &amp; AI Systems</p>
+       </div>`
+    : '';
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
+  <title>${safeHeadline}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#050507;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#e8e8e8;-webkit-font-smoothing:antialiased;">
+  <!-- Hidden Inbox Preview Preheader -->
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
+    ${safePreheader}&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;
+  </div>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#050507;padding:32px 14px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:620px;background-color:#101014;border:1px solid rgba(255,255,255,0.1);border-radius:24px;overflow:hidden;">
+          <!-- Top Accent Line -->
+          <tr>
+            <td style="height:4px;background:linear-gradient(90deg,#4f7fff 0%,#8bb4ff 50%,#22c55e 100%);font-size:0;line-height:0;">&nbsp;</td>
+          </tr>
+
+          <!-- Brand Top Bar -->
+          <tr>
+            <td style="padding:26px 34px 20px;background-color:#0b0b0f;border-bottom:1px solid rgba(255,255,255,0.07);">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td valign="middle">
+                    <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                      <tr>
+                        <td style="width:34px;height:34px;background-color:#ffffff;color:#080808;border-radius:9px;text-align:center;font-weight:900;font-size:16px;line-height:34px;">
+                          N
+                        </td>
+                        <td style="padding-left:11px;font-size:16px;font-weight:800;color:#ffffff;letter-spacing:-0.02em;">
+                          Neurovia Nexus
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                  <td align="right" valign="middle">
+                    <span style="display:inline-block;padding:5px 12px;border-radius:999px;background-color:rgba(79,127,255,0.14);border:1px solid ${badgeColor};color:#cfe0ff;font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;">
+                      ${safeBadge}
+                    </span>
+                  </td>
+                </tr>
+              </table>
+
+              <h1 style="margin:22px 0 6px;font-size:26px;line-height:1.22;font-weight:800;color:#ffffff;letter-spacing:-0.025em;">
+                ${safeHeadline}
+              </h1>
+              ${
+                safeSub
+                  ? `<p style="margin:0;font-size:14px;line-height:1.55;color:#9999a3;">${safeSub}</p>`
+                  : ''
+              }
+            </td>
+          </tr>
+
+          <!-- Main Body -->
+          <tr>
+            <td style="padding:30px 34px;font-size:15px;line-height:1.68;color:#d0d0d6;">
+              ${bodyHtml}
+              ${ctaRow}
+              ${signoffBlock}
+            </td>
+          </tr>
+
+          <!-- Direct Help Bar -->
+          <tr>
+            <td style="padding:18px 34px;background-color:#14141a;border-top:1px solid rgba(255,255,255,0.07);border-bottom:1px solid rgba(255,255,255,0.07);">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="font-size:12px;color:#a0a0ab;">
+                    <strong style="color:#ffffff;">Need live assistance?</strong> Call or WhatsApp <strong style="color:#ffffff;">+91 88220 96485</strong> (Mon&ndash;Sat, 9 AM&ndash;7 PM IST)
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Official Footer -->
+          <tr>
+            <td style="padding:22px 34px;background-color:#09090c;font-size:11px;line-height:1.6;color:#6e6e78;">
+              <strong style="color:#b8b8c2;">Neurovia Nexus Pvt. Ltd.</strong> &middot; MCA Incorporated &amp; MASI Certified Startup<br />
+              Guwahati, Assam 781001, India &middot;
+              <a href="mailto:support@neurovia.site" style="color:#8bb4ff;text-decoration:none;">support@neurovia.site</a> &middot;
+              <a href="${escapeHtml(FRONTEND_URL)}" style="color:#8bb4ff;text-decoration:none;">Website</a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
+function featureCardHtml(icon, title, desc) {
+  return `
+    <div style="background-color:#16161d;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:15px 18px;margin-bottom:10px;">
+      <div style="font-size:14px;font-weight:700;color:#ffffff;margin-bottom:3px;">
+        ${icon}&nbsp;&nbsp;${escapeHtml(title)}
+      </div>
+      <div style="font-size:13px;line-height:1.55;color:#9d9da8;">
+        ${escapeHtml(desc)}
+      </div>
+    </div>`;
+}
+
+/* ─── 1. Executive Pro Beta Tester Welcome Email ─── */
 async function sendBetaTesterEmails({ email, name, alreadyRegistered }) {
+  const displayGreeting = name ? `Hi ${escapeHtml(name)},` : 'Hello Innovator,';
+
   const userResult = await sendEmailSafe({
     to: email,
     subject: alreadyRegistered
-      ? "You're on the Neurovia Nexus Beta List!"
-      : 'Welcome to the Neurovia Nexus Beta-Testing Programme!',
-    html: wrapLayout({
-      badge: 'Early Access · Beta Programme',
-      title: alreadyRegistered ? "You're already registered!" : "You're in! Welcome to Neurovia Beta.",
+      ? 'Your Neurovia Nexus Beta Pass — Early Access Status Confirmed'
+      : "You're In — Official Neurovia Nexus Beta & NADT Early Access Pass",
+    html: wrapProEmail({
+      preheader:
+        'Welcome to the Neurovia Nexus Beta Programme. Your early-access pass to NADT & autonomous IT diagnostics is active.',
+      badge: 'Beta Cohort · Verified Pass',
+      badgeColor: 'rgba(34,197,94,0.45)',
+      headline: alreadyRegistered
+        ? 'Your Beta Access Pass is Active.'
+        : 'Welcome to the Neurovia Beta Cohort.',
+      subheadline:
+        'Official early-access confirmation for NADT & next-generation Neurovia Nexus releases.',
       bodyHtml: `
-        <p>Hi${name ? ' ' + escapeHtml(name) : ''},</p>
-        <p>Thank you for registering for the <strong>Neurovia Nexus Beta-Testing Programme</strong> with <strong style="color:#fff;">${escapeHtml(email)}</strong>.</p>
-        <p>As a verified beta tester, you'll receive:</p>
-        <ul style="padding-left:20px;color:#dddddd;">
-          <li>Early access to <strong>NADT (Autonomous Device Technician)</strong> diagnostic builds</li>
-          <li>Priority access to new Remote Support &amp; Smart Ticket features</li>
-          <li>Direct feedback channel with our engineering team</li>
-        </ul>
-        <p>We'll email you as soon as the next beta cohort opens.</p>
+        <p style="margin-top:0;">${displayGreeting}</p>
+        <p>
+          Thank you for stepping into the inner circle at <strong style="color:#ffffff;">Neurovia Nexus</strong>. Your email
+          (<strong style="color:#8bb4ff;">${escapeHtml(email)}</strong>) is officially registered in our
+          <strong style="color:#ffffff;">Beta-Testing Programme</strong>.
+        </p>
+
+        <!-- Pass Summary Box -->
+        <div style="background-color:#151924;border:1px solid rgba(79,127,255,0.3);border-radius:16px;padding:18px 20px;margin:22px 0;">
+          <div style="font-size:10px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:#8bb4ff;margin-bottom:8px;">
+            EARLY ACCESS CREDENTIAL
+          </div>
+          <div style="font-size:14px;color:#ffffff;margin-bottom:4px;"><strong>Member Email:</strong> ${escapeHtml(email)}</div>
+          <div style="font-size:14px;color:#ffffff;margin-bottom:4px;"><strong>Cohort Track:</strong> NADT Autonomous Diagnostics &amp; Platform Preview</div>
+          <div style="font-size:13px;color:#22c55e;font-weight:600;">&#10003; Priority Invite Status: Confirmed</div>
+        </div>
+
+        <p style="font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#888894;margin:24px 0 12px;">
+          What You Unlock as a Beta Member
+        </p>
+        ${featureCardHtml(
+          '🤖',
+          'NADT Autonomous Device Technician (Early Builds)',
+          'Hands-on preview access to our AI diagnostic engine before public release.'
+        )}
+        ${featureCardHtml(
+          '⚡',
+          'Priority Rollouts & Zero-Wait Support Features',
+          'Be the first to test Smart Ticket Routing, instant live diagnostics, and proactive system health alerts.'
+        )}
+        ${featureCardHtml(
+          '🎯',
+          'Direct Engineering Feedback Loop',
+          'Share bug reports and ideas directly with our founding engineers and earn permanent Founding Tester perks.'
+        )}
+
+        <p style="margin-top:20px;margin-bottom:0;font-size:14px;color:#b5b5c0;">
+          We'll send your private build link and release notes directly to this inbox as each milestone unlocks. Need help with a device today? Our certified technicians are already live.
+        </p>
       `,
-      ctaLabel: 'Explore Neurovia Services',
-      ctaUrl: `${FRONTEND_URL}/services`,
+      primaryCta: {
+        label: 'Explore Live Services',
+        url: `${FRONTEND_URL}/services`,
+      },
+      secondaryCta: {
+        label: 'Meet Our Team',
+        url: `${FRONTEND_URL}/about`,
+      },
+      showSignoff: true,
     }),
   });
 
   if (!alreadyRegistered) {
-    await sendEmailSafe({
+    sendEmailSafe({
       to: COMPANY_TEAM_EMAILS,
       replyTo: email,
-      subject: `[Beta Tester] New registration: ${email}`,
-      html: wrapLayout({
-        badge: 'Team Notification · Beta Signup',
-        title: 'New Beta Tester Registered',
+      subject: `[Beta Cohort] New Beta Tester Registered: ${email}`,
+      html: wrapProEmail({
+        preheader: `New beta registration from ${email}`,
+        badge: 'Internal Alert · Beta',
+        headline: 'New Beta Tester Joined',
+        subheadline: 'Recorded in MongoDB and confirmed via automated welcome email.',
         bodyHtml: `
-          <p>A new user just joined the Beta-Testing Programme on the website:</p>
-          <div style="background:#18181c;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;margin:16px 0;">
-            <div><strong>Email:</strong> ${escapeHtml(email)}</div>
-            ${name ? `<div><strong>Name:</strong> ${escapeHtml(name)}</div>` : ''}
-            <div><strong>Registered At:</strong> ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST</div>
+          <div style="background:#16161d;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:18px;">
+            <p style="margin:0 0 8px;"><strong>Email:</strong> ${escapeHtml(email)}</p>
+            ${name ? `<p style="margin:0 0 8px;"><strong>Name:</strong> ${escapeHtml(name)}</p>` : ''}
+            <p style="margin:0 0 8px;"><strong>Welcome Email Delivered:</strong> ${userResult.sent ? 'Yes ✓' : 'Pending'}</p>
+            <p style="margin:0;"><strong>Time:</strong> ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST</p>
           </div>
         `,
-        ctaLabel: 'Open Admin Console',
-        ctaUrl: `${FRONTEND_URL}/admin`,
+        primaryCta: {
+          label: 'Open Admin Console',
+          url: `${FRONTEND_URL}/admin/settings`,
+        },
       }),
-    });
+    }).catch(() => {});
   }
 
   return userResult;
 }
 
-/* ─── 2. Get in Touch / Contact Form ─── */
+/* ─── 2. Executive Pro Customer Welcome Email (Email Sign-Up & Google Sign-In) ─── */
+async function sendWelcomeSignupEmail({ email, name, authMethod = 'Email' }) {
+  const cleanName = name || email.split('@')[0] || 'there';
+
+  return sendEmailSafe({
+    to: email,
+    subject: `Welcome to Neurovia Nexus, ${cleanName} — Your Account is Ready`,
+    html: wrapProEmail({
+      preheader: `Welcome to Neurovia Nexus, ${cleanName}! Instant certified remote & onsite tech support across India.`,
+      badge: 'Verified Member',
+      badgeColor: 'rgba(79,127,255,0.45)',
+      headline: `Welcome to Neurovia Nexus, ${cleanName}.`,
+      subheadline: 'Stop settling for broken tech — your personal & business IT command center is live.',
+      bodyHtml: `
+        <p style="margin-top:0;">Hi <strong style="color:#ffffff;">${escapeHtml(cleanName)}</strong>,</p>
+        <p>
+          We're thrilled to welcome you to <strong style="color:#ffffff;">Neurovia Nexus</strong>. Your account
+          (<strong style="color:#8bb4ff;">${escapeHtml(email)}</strong>) is active and verified via ${escapeHtml(authMethod)}.
+        </p>
+        <p>
+          Whether it's an urgent OS crash, malware cleanup, office network deployment, or custom cloud &amp; AI engineering — you now have one certified team backing every device you rely on.
+        </p>
+
+        <p style="font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#888894;margin:24px 0 12px;">
+          Everything Included With Your Account
+        </p>
+        ${featureCardHtml(
+          '⚡',
+          '30-Minute Technician Assignment',
+          'Book remote screen-share diagnostics or doorstep hardware repair in under 2 minutes.'
+        )}
+        ${featureCardHtml(
+          '🛡️',
+          'Radical Transparency · No Fix, No Fee',
+          'Clear upfront INR pricing, permission-only access, and documented fixes you can trust.'
+        )}
+        ${featureCardHtml(
+          '💳',
+          'Flexible Checkout (Razorpay UPI / Cards or Pay-After-Fix)',
+          'Pay seamlessly online for priority dispatch or book now and settle once your issue is resolved.'
+        )}
+
+        <div style="background-color:#16161d;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:16px 18px;margin-top:20px;font-size:13px;color:#b8b8c2;">
+          <strong style="color:#ffffff;">Quick Tip:</strong> Keep your phone &amp; profession updated in your
+          <a href="${escapeHtml(FRONTEND_URL)}/profile" style="color:#8bb4ff;text-decoration:underline;">Neurovia Profile</a>
+          for faster 1-click support bookings.
+        </div>
+      `,
+      primaryCta: {
+        label: 'Book Support or Explore Services',
+        url: `${FRONTEND_URL}/services`,
+      },
+      secondaryCta: {
+        label: 'Open My Profile',
+        url: `${FRONTEND_URL}/profile`,
+      },
+      showSignoff: true,
+    }),
+  });
+}
+
+/* ─── 3. Get in Touch / Contact Form ─── */
 async function sendContactMessageEmails({ referenceId, name, email, phone, subject, message }) {
-  // 1) Notify Company Team (replyTo = sender's email so team can hit Reply directly!)
   const teamResult = await sendEmailSafe({
     to: COMPANY_TEAM_EMAILS,
     replyTo: email,
     subject: `[Get in Touch #${referenceId}] ${subject} — from ${name}`,
-    html: wrapLayout({
+    html: wrapProEmail({
+      preheader: `New message from ${name} (${email}): ${subject}`,
       badge: `New Inquiry · ${referenceId}`,
-      title: subject,
+      headline: subject,
+      subheadline: `Submitted by ${name} — hit Reply to answer ${email} directly.`,
       bodyHtml: `
-        <p>A new message was submitted via the <strong>Get in Touch</strong> form on Neurovia Nexus. Hit <strong>Reply</strong> in your email client to respond directly to ${escapeHtml(name)}.</p>
-        <div style="background:#18181c;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:18px;margin:18px 0;">
+        <div style="background:#16161d;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:18px;margin-bottom:18px;font-size:14px;">
           <p style="margin:0 0 8px;"><strong>Reference:</strong> <span style="color:#8bb4ff;">${escapeHtml(referenceId)}</span></p>
-          <p style="margin:0 0 8px;"><strong>Name:</strong> ${escapeHtml(name)}</p>
+          <p style="margin:0 0 8px;"><strong>Sender:</strong> ${escapeHtml(name)}</p>
           <p style="margin:0 0 8px;"><strong>Email:</strong> <a href="mailto:${escapeHtml(email)}" style="color:#8bb4ff;">${escapeHtml(email)}</a></p>
           <p style="margin:0 0 8px;"><strong>Phone:</strong> ${escapeHtml(phone || 'Not provided')}</p>
-          <p style="margin:0;"><strong>Time:</strong> ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST</p>
+          <p style="margin:0;"><strong>Received:</strong> ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST</p>
         </div>
-        <div style="background:#0d0d10;border-left:3px solid #4f7fff;padding:16px;border-radius:8px;white-space:pre-wrap;color:#ffffff;">${escapeHtml(message)}</div>
+        <div style="background:#0b0b0f;border-left:3px solid #4f7fff;padding:16px 18px;border-radius:10px;white-space:pre-wrap;color:#ffffff;font-size:14px;">${escapeHtml(message)}</div>
       `,
-      ctaLabel: 'View in Admin Console',
-      ctaUrl: `${FRONTEND_URL}/admin/tickets`,
+      primaryCta: {
+        label: 'Manage in Admin Console',
+        url: `${FRONTEND_URL}/admin/tickets`,
+      },
     }),
   });
 
-  // 2) Auto-confirmation to Sender
   const senderResult = await sendEmailSafe({
     to: email,
-    subject: `We received your message [${referenceId}] — Neurovia Nexus`,
-    html: wrapLayout({
-      badge: `Reference · ${referenceId}`,
-      title: 'Thanks for reaching out!',
+    subject: `We've received your message [${referenceId}] — Neurovia Nexus`,
+    html: wrapProEmail({
+      preheader: `Reference ${referenceId}: Our team will reply within a few business hours.`,
+      badge: `Ticket · ${referenceId}`,
+      headline: "We've got your message.",
+      subheadline: 'Our team at Neurovia Nexus usually replies within a few business hours.',
       bodyHtml: `
-        <p>Hi ${escapeHtml(name)},</p>
-        <p>We've received your message regarding <strong style="color:#fff;">"${escapeHtml(subject)}"</strong>. A member of our team will review it and reply within a few hours during business hours (Mon–Sat, 9 AM – 7 PM IST).</p>
-        <div style="background:#18181c;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;margin:16px 0;">
-          <div style="font-size:12px;color:#888888;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Your message copy</div>
-          <div style="white-space:pre-wrap;color:#dddddd;font-size:14px;">${escapeHtml(message)}</div>
+        <p style="margin-top:0;">Hi <strong style="color:#ffffff;">${escapeHtml(name)}</strong>,</p>
+        <p>Thank you for getting in touch regarding <strong style="color:#ffffff;">"${escapeHtml(subject)}"</strong>. Your inquiry has been routed to our leadership &amp; support desk under reference <strong style="color:#8bb4ff;">${escapeHtml(referenceId)}</strong>.</p>
+        <div style="background:#16161d;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:16px 18px;margin:20px 0;">
+          <div style="font-size:11px;color:#888894;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Your Message Copy</div>
+          <div style="white-space:pre-wrap;color:#d8d8e0;font-size:14px;">${escapeHtml(message)}</div>
         </div>
-        <p style="font-size:13px;color:#999999;">Need urgent tech support right away? Call or WhatsApp us at <strong style="color:#fff;">+91 88220 96485</strong>.</p>
       `,
-      ctaLabel: 'Book Priority Support',
-      ctaUrl: `${FRONTEND_URL}/book`,
+      primaryCta: {
+        label: 'Need Urgent Help? Book Now',
+        url: `${FRONTEND_URL}/book`,
+      },
+      showSignoff: true,
     }),
   });
 
   return { teamSent: teamResult.sent, senderSent: senderResult.sent };
 }
 
-/* ─── 3. Support Booking Confirmation ─── */
+/* ─── 4. Support Booking Confirmation ─── */
 async function sendBookingEmails(booking) {
   await sendEmailSafe({
     to: booking.email,
     subject: `Booking Confirmed [${booking.bookingNumber}] — Neurovia Nexus`,
-    html: wrapLayout({
+    html: wrapProEmail({
+      preheader: `Booking ${booking.bookingNumber} confirmed. A certified technician will be assigned within 30 minutes.`,
       badge: `Booking · ${booking.bookingNumber}`,
-      title: 'Your technician request is confirmed!',
+      badgeColor: 'rgba(34,197,94,0.45)',
+      headline: 'Your Technician Request is Confirmed.',
+      subheadline: 'A certified Neurovia specialist is being matched to your device.',
       bodyHtml: `
-        <p>Hi ${escapeHtml(booking.customerName)},</p>
-        <p>Your support booking has been logged. A certified Neurovia technician will be assigned within <strong>30 minutes</strong> during business hours.</p>
-        <div style="background:#18181c;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:18px;margin:18px 0;font-size:14px;">
+        <p style="margin-top:0;">Hi <strong style="color:#ffffff;">${escapeHtml(booking.customerName)}</strong>,</p>
+        <p>Your support request has been logged. During business hours (Mon&ndash;Sat, 9 AM&ndash;7 PM IST), a certified technician will reach out within <strong style="color:#ffffff;">30 minutes</strong>.</p>
+        <div style="background:#16161d;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:18px;margin:20px 0;font-size:14px;">
           <p style="margin:0 0 8px;"><strong>Booking Reference:</strong> <span style="color:#8bb4ff;font-weight:700;">${escapeHtml(booking.bookingNumber)}</span></p>
           <p style="margin:0 0 8px;"><strong>Device:</strong> ${escapeHtml(booking.deviceType)}${booking.deviceBrand ? ` (${escapeHtml(booking.deviceBrand)})` : ''}</p>
           <p style="margin:0 0 8px;"><strong>Support Mode:</strong> ${escapeHtml(booking.supportType.toUpperCase())}</p>
-          <p style="margin:0 0 8px;"><strong>Preferred Slot:</strong> ${escapeHtml(booking.preferredDate || 'Earliest available')} · ${escapeHtml(booking.preferredTime || 'Any time')}</p>
-          <p style="margin:0;"><strong>Payment Status:</strong> ${booking.paymentStatus === 'paid' ? '<span style="color:#22c55e;">PAID ✓</span>' : 'Pay After Fix'}</p>
+          <p style="margin:0 0 8px;"><strong>Preferred Slot:</strong> ${escapeHtml(booking.preferredDate || 'Earliest available')} &middot; ${escapeHtml(booking.preferredTime || 'Any time')}</p>
+          <p style="margin:0;"><strong>Payment Status:</strong> ${booking.paymentStatus === 'paid' ? '<span style="color:#22c55e;font-weight:700;">PAID ✓</span>' : 'Pay After Fix'}</p>
         </div>
       `,
-      ctaLabel: 'View Services',
-      ctaUrl: `${FRONTEND_URL}/services`,
+      primaryCta: {
+        label: 'View Neurovia Services',
+        url: `${FRONTEND_URL}/services`,
+      },
+      showSignoff: true,
     }),
   });
 
@@ -225,105 +555,103 @@ async function sendBookingEmails(booking) {
     to: COMPANY_TEAM_EMAILS,
     replyTo: booking.email,
     subject: `[New Booking #${booking.bookingNumber}] ${booking.supportType.toUpperCase()} — ${booking.customerName}`,
-    html: wrapLayout({
+    html: wrapProEmail({
+      preheader: `${booking.customerName} booked ${booking.supportType} support for ${booking.deviceType}`,
       badge: `Dispatch Alert · ${booking.bookingNumber}`,
-      title: `${booking.deviceType} (${booking.supportType})`,
+      headline: `${booking.deviceType} (${booking.supportType.toUpperCase()})`,
       bodyHtml: `
-        <div style="background:#18181c;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:18px;margin:12px 0;font-size:14px;">
+        <div style="background:#16161d;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:18px;margin-bottom:14px;font-size:14px;">
           <p style="margin:0 0 6px;"><strong>Customer:</strong> ${escapeHtml(booking.customerName)}</p>
           <p style="margin:0 0 6px;"><strong>Phone:</strong> ${escapeHtml(booking.phone)}</p>
           <p style="margin:0 0 6px;"><strong>Email:</strong> ${escapeHtml(booking.email)}</p>
-          <p style="margin:0 0 6px;"><strong>Device / OS:</strong> ${escapeHtml(booking.deviceType)} ${escapeHtml(booking.deviceBrand || '')} · ${escapeHtml(booking.operatingSystem || 'N/A')}</p>
-          <p style="margin:0 0 6px;"><strong>Slot:</strong> ${escapeHtml(booking.preferredDate || 'ASAP')} · ${escapeHtml(booking.preferredTime || 'Any time')}</p>
+          <p style="margin:0 0 6px;"><strong>Device / OS:</strong> ${escapeHtml(booking.deviceType)} ${escapeHtml(booking.deviceBrand || '')} &middot; ${escapeHtml(booking.operatingSystem || 'N/A')}</p>
+          <p style="margin:0 0 6px;"><strong>Slot:</strong> ${escapeHtml(booking.preferredDate || 'ASAP')} &middot; ${escapeHtml(booking.preferredTime || 'Any time')}</p>
           <p style="margin:0;"><strong>Payment:</strong> ${escapeHtml(booking.paymentStatus)}</p>
         </div>
-        <div style="background:#0d0d10;border-left:3px solid #22c55e;padding:14px;border-radius:8px;white-space:pre-wrap;color:#fff;">${escapeHtml(booking.issueDescription)}</div>
+        <div style="background:#0b0b0f;border-left:3px solid #22c55e;padding:14px 16px;border-radius:10px;white-space:pre-wrap;color:#ffffff;">${escapeHtml(booking.issueDescription)}</div>
       `,
-      ctaLabel: 'Manage in Admin Console',
-      ctaUrl: `${FRONTEND_URL}/admin/tickets`,
+      primaryCta: {
+        label: 'Assign in Admin Console',
+        url: `${FRONTEND_URL}/admin/tickets`,
+      },
     }),
   });
 }
 
-/* ─── 4. Razorpay Payment Receipt ─── */
+/* ─── 5. Razorpay Payment Receipt ─── */
 async function sendPaymentReceiptEmails(payment) {
   await sendEmailSafe({
     to: payment.customerEmail,
-    subject: `Payment Receipt [${payment.receiptNumber}] — ₹${payment.amountInr} · Neurovia Nexus`,
-    html: wrapLayout({
-      badge: `Payment Verified · ${payment.receiptNumber}`,
-      title: `₹${payment.amountInr.toLocaleString('en-IN')} Paid Successfully`,
+    subject: `Official Payment Receipt [${payment.receiptNumber}] — ₹${payment.amountInr.toLocaleString('en-IN')} · Neurovia Nexus`,
+    html: wrapProEmail({
+      preheader: `Receipt ${payment.receiptNumber} for ₹${payment.amountInr.toLocaleString('en-IN')} — ${payment.serviceTitle}`,
+      badge: `Paid ✓ · ${payment.receiptNumber}`,
+      badgeColor: 'rgba(34,197,94,0.45)',
+      headline: `₹${payment.amountInr.toLocaleString('en-IN')} Payment Confirmed.`,
+      subheadline: 'Your priority service order has been verified and queued for immediate dispatch.',
       bodyHtml: `
-        <p>Hi ${escapeHtml(payment.customerName)},</p>
-        <p>Thank you for your payment! Your service order is confirmed and prioritized with our technical team.</p>
-        <div style="background:#18181c;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:18px;margin:18px 0;font-size:14px;">
-          <p style="margin:0 0 8px;"><strong>Receipt No:</strong> <span style="color:#22c55e;">${escapeHtml(payment.receiptNumber)}</span></p>
-          <p style="margin:0 0 8px;"><strong>Service:</strong> ${escapeHtml(payment.serviceTitle)}</p>
+        <p style="margin-top:0;">Hi <strong style="color:#ffffff;">${escapeHtml(payment.customerName)}</strong>,</p>
+        <p>Thank you for choosing <strong style="color:#ffffff;">Neurovia Nexus</strong>. Below is your official Razorpay payment receipt:</p>
+        <div style="background:#16161d;border:1px solid rgba(34,197,94,0.28);border-radius:16px;padding:18px 20px;margin:20px 0;font-size:14px;">
+          <p style="margin:0 0 8px;"><strong>Receipt Number:</strong> <span style="color:#22c55e;font-weight:700;">${escapeHtml(payment.receiptNumber)}</span></p>
+          <p style="margin:0 0 8px;"><strong>Service Package:</strong> ${escapeHtml(payment.serviceTitle)}</p>
           <p style="margin:0 0 8px;"><strong>Amount Paid:</strong> ₹${payment.amountInr.toLocaleString('en-IN')} INR</p>
           <p style="margin:0 0 8px;"><strong>Razorpay Payment ID:</strong> ${escapeHtml(payment.razorpayPaymentId)}</p>
           <p style="margin:0;"><strong>Date:</strong> ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST</p>
         </div>
-        <p>Our specialist will reach out to you shortly to begin your session.</p>
       `,
-      ctaLabel: 'Contact Priority Desk',
-      ctaUrl: `${FRONTEND_URL}/contact`,
+      primaryCta: {
+        label: 'Contact Priority Desk',
+        url: `${FRONTEND_URL}/contact`,
+      },
+      showSignoff: true,
     }),
   });
 
   await sendEmailSafe({
     to: COMPANY_TEAM_EMAILS,
     replyTo: payment.customerEmail,
-    subject: `[Payment Received ₹${payment.amountInr}] ${payment.serviceTitle} — ${payment.customerName}`,
-    html: wrapLayout({
+    subject: `[Payment ₹${payment.amountInr}] ${payment.serviceTitle} — ${payment.customerName}`,
+    html: wrapProEmail({
+      preheader: `Verified Razorpay payment of ₹${payment.amountInr} from ${payment.customerName}`,
       badge: `Razorpay Paid · ${payment.receiptNumber}`,
-      title: `₹${payment.amountInr.toLocaleString('en-IN')} Received`,
+      headline: `₹${payment.amountInr.toLocaleString('en-IN')} Received`,
       bodyHtml: `
-        <div style="background:#18181c;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:18px;margin:12px 0;font-size:14px;">
+        <div style="background:#16161d;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:18px;font-size:14px;">
           <p style="margin:0 0 6px;"><strong>Customer:</strong> ${escapeHtml(payment.customerName)} (${escapeHtml(payment.customerEmail)})</p>
           <p style="margin:0 0 6px;"><strong>Phone:</strong> ${escapeHtml(payment.customerPhone || 'N/A')}</p>
           <p style="margin:0 0 6px;"><strong>Service:</strong> ${escapeHtml(payment.serviceTitle)} (${escapeHtml(payment.serviceCategory)})</p>
           <p style="margin:0 0 6px;"><strong>Payment ID:</strong> ${escapeHtml(payment.razorpayPaymentId)}</p>
-          <p style="margin:0 0 6px;"><strong>Order ID:</strong> ${escapeHtml(payment.razorpayOrderId)}</p>
-          ${payment.notes ? `<p style="margin:6px 0 0;"><strong>Notes:</strong> ${escapeHtml(payment.notes)}</p>` : ''}
+          <p style="margin:0;"><strong>Order ID:</strong> ${escapeHtml(payment.razorpayOrderId)}</p>
         </div>
       `,
-      ctaLabel: 'View Payments in Admin',
-      ctaUrl: `${FRONTEND_URL}/admin`,
+      primaryCta: {
+        label: 'View in Admin Console',
+        url: `${FRONTEND_URL}/admin/analytics`,
+      },
     }),
   });
 }
 
-/* ─── 5. Newsletter, Welcome & Password Reset ─── */
+/* ─── 6. Newsletter & Password Reset ─── */
 async function sendNewsletterEmail(email) {
   return sendEmailSafe({
     to: email,
-    subject: "You're subscribed to the Neurovia Nexus Loop!",
-    html: wrapLayout({
-      badge: 'Newsletter',
-      title: 'Welcome to the Loop.',
+    subject: "Welcome to The Neurovia Loop — Insights, Cybersecurity & AI Research",
+    html: wrapProEmail({
+      preheader: 'Subscribed to Neurovia Nexus insights & NADT AI research updates.',
+      badge: 'The Loop · Subscribed',
+      headline: "You're in the Loop.",
+      subheadline: 'Practical IT care, SME cybersecurity playbooks, and NADT research dispatches.',
       bodyHtml: `
-        <p>Thanks for subscribing with <strong style="color:#fff;">${escapeHtml(email)}</strong>!</p>
-        <p>You'll get practical cybersecurity tips, PC care guides, and dispatches from our NADT AI diagnostics research lab — zero spam, ever.</p>
+        <p style="margin-top:0;">Thanks for subscribing with <strong style="color:#8bb4ff;">${escapeHtml(email)}</strong>!</p>
+        <p>Expect concise, high-signal articles written directly by our engineers — zero fluff and zero spam.</p>
       `,
-      ctaLabel: 'Read Latest Articles',
-      ctaUrl: `${FRONTEND_URL}/blog`,
-    }),
-  });
-}
-
-async function sendWelcomeSignupEmail({ email, name }) {
-  return sendEmailSafe({
-    to: email,
-    subject: 'Welcome to Neurovia Nexus!',
-    html: wrapLayout({
-      badge: 'Account Created',
-      title: `Welcome aboard, ${name || 'there'}!`,
-      bodyHtml: `
-        <p>Your Neurovia Nexus account is ready.</p>
-        <p>You can now book certified remote or onsite technicians, manage your profile, or register a partner workshop.</p>
-      `,
-      ctaLabel: 'Go to Neurovia Nexus',
-      ctaUrl: FRONTEND_URL,
+      primaryCta: {
+        label: 'Read Latest Articles',
+        url: `${FRONTEND_URL}/blog`,
+      },
+      showSignoff: true,
     }),
   });
 }
@@ -331,17 +659,21 @@ async function sendWelcomeSignupEmail({ email, name }) {
 async function sendPasswordResetEmail({ email, name, resetUrl }) {
   return sendEmailSafe({
     to: email,
-    subject: 'Reset your Neurovia Nexus password',
-    html: wrapLayout({
+    subject: 'Reset Your Neurovia Nexus Password',
+    html: wrapProEmail({
+      preheader: 'Password reset link valid for 30 minutes.',
       badge: 'Security · Password Reset',
-      title: 'Password Reset Request',
+      headline: 'Password Reset Request',
+      subheadline: 'This secure link expires in 30 minutes.',
       bodyHtml: `
-        <p>Hi ${escapeHtml(name || 'there')},</p>
-        <p>We received a request to reset the password for your Neurovia Nexus account. Click the button below within <strong>30 minutes</strong> to choose a new password:</p>
-        <p style="font-size:12px;color:#888888;margin-top:20px;">If you did not request this, you can safely ignore this email — your password will remain unchanged.</p>
+        <p style="margin-top:0;">Hi <strong style="color:#ffffff;">${escapeHtml(name || 'there')}</strong>,</p>
+        <p>We received a request to reset the password for your Neurovia Nexus account (<strong style="color:#8bb4ff;">${escapeHtml(email)}</strong>). Click the button below to choose a new password:</p>
+        <p style="font-size:12px;color:#888894;margin-top:20px;">If you did not request a password reset, you can safely ignore this email — your account remains secure.</p>
       `,
-      ctaLabel: 'Reset Password',
-      ctaUrl: resetUrl,
+      primaryCta: {
+        label: 'Set New Password',
+        url: resetUrl,
+      },
     }),
   });
 }
@@ -356,4 +688,3 @@ module.exports = {
   sendWelcomeSignupEmail,
   sendPasswordResetEmail,
 };
-

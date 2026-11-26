@@ -36,6 +36,10 @@ const userSchema = new mongoose.Schema(
       enum: ['active', 'inactive'],
       default: 'active',
     },
+    welcomeEmailSent: {
+      type: Boolean,
+      default: false,
+    },
     resetPasswordTokenHash: { type: String, select: false },
     resetPasswordExpires: { type: Date, select: false },
     // --- Additional Profile Fields ---

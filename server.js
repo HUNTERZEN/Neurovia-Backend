@@ -145,13 +145,33 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
 
           let existingUser = await User.findOne({ google_id: profile.id });
           if (existingUser) {
+            if (!existingUser.welcomeEmailSent) {
+              existingUser.welcomeEmailSent = true;
+              await existingUser.save();
+              sendWelcomeSignupEmail({
+                email: existingUser.email,
+                name: existingUser.fullName || existingUser.username,
+                authMethod: 'Google Sign-In',
+              }).catch((err) => console.error('Google welcome email error:', err.message));
+              existingUser._justWelcomed = true;
+            }
             return done(null, existingUser);
           }
 
           existingUser = await User.findOne({ email });
           if (existingUser) {
             existingUser.google_id = profile.id;
+            const shouldWelcome = !existingUser.welcomeEmailSent;
+            existingUser.welcomeEmailSent = true;
             await existingUser.save();
+            if (shouldWelcome) {
+              sendWelcomeSignupEmail({
+                email: existingUser.email,
+                name: existingUser.fullName || existingUser.username,
+                authMethod: 'Google Sign-In',
+              }).catch((err) => console.error('Google welcome email error:', err.message));
+              existingUser._justWelcomed = true;
+            }
             return done(null, existingUser);
           }
 
@@ -161,7 +181,15 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
             fullName: displayName,
             email,
             google_id: profile.id,
+            welcomeEmailSent: true,
           });
+          newUser._isNewUser = true;
+
+          sendWelcomeSignupEmail({
+            email: newUser.email,
+            name: newUser.fullName || newUser.username,
+            authMethod: 'Google Sign-In',
+          }).catch((err) => console.error('Google signup welcome email error:', err.message));
 
           return done(null, newUser);
         } catch (err) {
@@ -229,7 +257,8 @@ app.get(
       JWT_SECRET,
       { expiresIn: '7d', algorithm: 'HS256' }
     );
-    res.redirect(`${FRONTEND_URL}/?token=${encodeURIComponent(token)}`);
+    const welcomeType = req.user._isNewUser ? 'new' : 'back';
+    res.redirect(`${FRONTEND_URL}/?token=${encodeURIComponent(token)}&welcome=${welcomeType}`);
   }
 );
 
@@ -290,13 +319,33 @@ app.post('/api/signup', authLimiter, async (req, res) => {
       fullName: fullName || username,
       email,
       password: hashedPassword,
+      welcomeEmailSent: true,
     });
 
-    sendWelcomeSignupEmail({ email: created.email, name: created.fullName || created.username }).catch(
-      (err) => console.error('Signup welcome email error:', err.message)
+    const token = jwt.sign(
+      { userId: created._id, username: created.username, email: created.email, role: created.role || 'user' },
+      JWT_SECRET,
+      { expiresIn: '7d', algorithm: 'HS256' }
     );
 
-    return res.status(201).json({ message: 'User registered successfully' });
+    sendWelcomeSignupEmail({
+      email: created.email,
+      name: created.fullName || created.username,
+      authMethod: 'Email & Password',
+    }).catch((err) => console.error('Signup welcome email error:', err.message));
+
+    return res.status(201).json({
+      message: 'User registered successfully',
+      token,
+      isNewUser: true,
+      user: {
+        id: created._id,
+        username: created.username,
+        email: created.email,
+        name: created.fullName || created.username,
+        role: created.role || 'user',
+      },
+    });
   } catch (error) {
     console.error('Signup error:', error.message);
     return res.status(500).json({ error: 'Server error' });
@@ -328,6 +377,16 @@ app.post('/api/login', authLimiter, async (req, res) => {
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) {
       return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    if (!user.welcomeEmailSent) {
+      user.welcomeEmailSent = true;
+      await user.save();
+      sendWelcomeSignupEmail({
+        email: user.email,
+        name: user.fullName || user.username,
+        authMethod: 'Email & Password',
+      }).catch((err) => console.error('First-login welcome email error:', err.message));
     }
 
     const token = jwt.sign(

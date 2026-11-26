@@ -97,6 +97,9 @@ module.exports = {
   ALLOWED_ORIGINS,
   EMAIL_USER: process.env.EMAIL_USER || '',
   EMAIL_PASS: process.env.EMAIL_PASS || '',
+  MAIL_RELAY_URL: (
+    process.env.MAIL_RELAY_URL || 'https://neurovia-tech-support.vercel.app/api/mail-relay'
+  ).trim(),
   COMPANY_TEAM_EMAILS,
   RAZORPAY_KEY_ID: (process.env.RAZORPAY_KEY_ID || '').trim(),
   RAZORPAY_KEY_SECRET: (process.env.RAZORPAY_KEY_SECRET || '').trim(),
